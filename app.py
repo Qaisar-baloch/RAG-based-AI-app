@@ -1,6 +1,6 @@
+import hashlib
 import io
 import os
-from typing import List, Dict
 
 import faiss
 import numpy as np
@@ -10,71 +10,117 @@ from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 
 
-# -----------------------------
+# ============================================================
 # Configuration
-# -----------------------------
-EMBEDDING_MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
-GROQ_MODEL = "openai/gpt-oss-120b"
+# ============================================================
 
-# Chunking is token-based using the embedding model's tokenizer.
+st.set_page_config(
+    page_title="PDF RAG Chatbot",
+    page_icon="📚",
+    layout="wide",
+)
+
+GROQ_MODEL = "openai/gpt-oss-120b"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
 CHUNK_SIZE = 350
 CHUNK_OVERLAP = 60
 TOP_K = 5
 
 
-# -----------------------------
-# Cached resources
-# -----------------------------
-@st.cache_resource(show_spinner="Loading embedding model...")
-def load_embedding_model():
-    return SentenceTransformer(EMBEDDING_MODEL_NAME)
+# ============================================================
+# Load API Key from Streamlit Secrets
+# ============================================================
 
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except Exception:
+    st.error(
+        "GROQ_API_KEY is not configured. "
+        "Add it under Streamlit Cloud → Settings → Secrets."
+    )
+    st.stop()
+
+
+# ============================================================
+# Initialize Groq Client
+# ============================================================
+
+client = Groq(api_key=GROQ_API_KEY)
+
+
+# ============================================================
+# Load Embedding Model
+# ============================================================
 
 @st.cache_resource
-def get_groq_client(api_key: str):
-    return Groq(api_key=api_key)
+def load_embedding_model():
+    return SentenceTransformer(EMBEDDING_MODEL)
 
 
-# -----------------------------
-# PDF + RAG functions
-# -----------------------------
-def extract_pdf_text(pdf_bytes: bytes) -> List[Dict]:
-    """Extract text page-by-page from a PDF."""
+embedding_model = load_embedding_model()
+
+
+# ============================================================
+# PDF Text Extraction
+# ============================================================
+
+def extract_text_from_pdf(pdf_bytes):
+    """
+    Extract text from every page of the uploaded PDF.
+    Returns a list of dictionaries containing page number and text.
+    """
+
     reader = PdfReader(io.BytesIO(pdf_bytes))
+
     pages = []
 
     for page_number, page in enumerate(reader.pages, start=1):
-        text = page.extract_text() or ""
-        text = " ".join(text.split())
+        text = page.extract_text()
 
-        if text:
-            pages.append({
-                "page": page_number,
-                "text": text,
-            })
+        if text and text.strip():
+            pages.append(
+                {
+                    "page": page_number,
+                    "text": text.strip(),
+                }
+            )
 
     return pages
 
 
-def chunk_text(text: str, tokenizer, chunk_size: int = CHUNK_SIZE,
-               overlap: int = CHUNK_OVERLAP) -> List[str]:
-    """Split text into overlapping token-based chunks."""
-    token_ids = tokenizer.encode(text, add_special_tokens=False)
+# ============================================================
+# Token-Based Chunking
+# ============================================================
 
-    if not token_ids:
-        return []
+def chunk_text(text, tokenizer, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """
+    Split text into overlapping chunks based on tokenizer tokens.
+    """
+
+    token_ids = tokenizer.encode(
+        text,
+        add_special_tokens=False,
+    )
 
     chunks = []
+
     start = 0
 
     while start < len(token_ids):
         end = min(start + chunk_size, len(token_ids))
-        chunk = tokenizer.decode(token_ids[start:end], skip_special_tokens=True).strip()
+
+        chunk_token_ids = token_ids[start:end]
+
+        chunk = tokenizer.decode(
+            chunk_token_ids,
+            skip_special_tokens=True,
+        ).strip()
 
         if chunk:
             chunks.append(chunk)
 
-        if end == len(token_ids):
+        if end >= len(token_ids):
             break
 
         start = end - overlap
@@ -82,24 +128,49 @@ def chunk_text(text: str, tokenizer, chunk_size: int = CHUNK_SIZE,
     return chunks
 
 
-def build_chunks(pages: List[Dict], tokenizer) -> List[Dict]:
-    """Create chunks while preserving source page numbers."""
+# ============================================================
+# Create Chunks with Page Metadata
+# ============================================================
+
+def create_chunks(pages):
+    """
+    Create chunks while preserving the PDF page number.
+    """
+
+    tokenizer = embedding_model.tokenizer
+
     all_chunks = []
 
-    for page in pages:
-        chunks = chunk_text(page["text"], tokenizer)
+    for page_data in pages:
+        page_number = page_data["page"]
+        page_text = page_data["text"]
 
-        for chunk in chunks:
-            all_chunks.append({
-                "text": chunk,
-                "page": page["page"],
-            })
+        chunks = chunk_text(
+            page_text,
+            tokenizer,
+        )
+
+        for chunk_number, chunk in enumerate(chunks, start=1):
+            all_chunks.append(
+                {
+                    "text": chunk,
+                    "page": page_number,
+                    "chunk": chunk_number,
+                }
+            )
 
     return all_chunks
 
 
-def build_faiss_index(chunks: List[Dict], embedding_model):
-    """Create a normalized cosine-similarity FAISS index."""
+# ============================================================
+# Create FAISS Vector Index
+# ============================================================
+
+def create_faiss_index(chunks):
+    """
+    Generate embeddings for chunks and store them in FAISS.
+    """
+
     texts = [item["text"] for item in chunks]
 
     embeddings = embedding_model.encode(
@@ -107,225 +178,371 @@ def build_faiss_index(chunks: List[Dict], embedding_model):
         convert_to_numpy=True,
         normalize_embeddings=True,
         show_progress_bar=False,
-    ).astype("float32")
+    )
+
+    embeddings = embeddings.astype("float32")
 
     dimension = embeddings.shape[1]
+
     index = faiss.IndexFlatIP(dimension)
+
     index.add(embeddings)
 
     return index
 
 
-def retrieve(query: str, index, chunks: List[Dict], embedding_model, top_k: int = TOP_K):
-    """Retrieve the most relevant chunks for a user query."""
-    query_embedding = embedding_model.encode(
-        [query],
+# ============================================================
+# Search Relevant Chunks
+# ============================================================
+
+def search_documents(question, index, chunks, top_k=TOP_K):
+    """
+    Embed the question and retrieve the most relevant chunks.
+    """
+
+    question_embedding = embedding_model.encode(
+        [question],
         convert_to_numpy=True,
         normalize_embeddings=True,
-    ).astype("float32")
+        show_progress_bar=False,
+    )
 
-    k = min(top_k, len(chunks))
-    scores, indices = index.search(query_embedding, k)
+    question_embedding = question_embedding.astype("float32")
+
+    scores, indices = index.search(
+        question_embedding,
+        min(top_k, len(chunks)),
+    )
 
     results = []
 
-    for score, idx in zip(scores[0], indices[0]):
-        if idx == -1:
+    for score, index_position in zip(scores[0], indices[0]):
+
+        if index_position == -1:
             continue
 
-        item = chunks[int(idx)].copy()
-        item["score"] = float(score)
-        results.append(item)
+        result = chunks[index_position].copy()
+        result["score"] = float(score)
+
+        results.append(result)
 
     return results
 
 
-def generate_answer(query: str, retrieved_chunks: List[Dict], client: Groq) -> str:
-    """Ask the Groq open-weight model to answer using retrieved context."""
+# ============================================================
+# Generate Answer with Groq
+# ============================================================
+
+def generate_answer(question, retrieved_chunks):
+
     context_parts = []
 
-    for i, item in enumerate(retrieved_chunks, start=1):
+    for item in retrieved_chunks:
+
         context_parts.append(
-            f"[Source {i} | PDF page {item['page']}]\n{item['text']}"
+            f"[Page {item['page']}]\n{item['text']}"
         )
 
     context = "\n\n".join(context_parts)
 
-    system_prompt = """You are a helpful document question-answering assistant.
+    system_prompt = """
+You are a helpful document question-answering assistant.
 
-Answer the user's question using ONLY the provided document context.
-If the answer cannot be found in the context, clearly say that the information
-is not available in the uploaded document.
+Answer the user's question using ONLY the information contained
+in the provided document context.
 
-Do not invent facts. Keep the answer clear and useful.
-When possible, mention the relevant PDF page number(s).
+Rules:
+1. Do not invent information.
+2. If the answer is not present in the context, clearly say:
+   "I could not find the answer in the uploaded document."
+3. Keep the answer clear and concise.
+4. When possible, mention the relevant page number.
 """
 
-    user_prompt = f"""Document context:
+    user_prompt = f"""
+Document context:
 
 {context}
 
 User question:
-{query}
+
+{question}
 """
 
     response = client.chat.completions.create(
         model=GROQ_MODEL,
         messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
+            {
+                "role": "system",
+                "content": system_prompt,
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
         ],
         temperature=0.2,
-        max_completion_tokens=1200,
     )
 
     return response.choices[0].message.content
 
 
-# -----------------------------
-# Streamlit UI
-# -----------------------------
-st.set_page_config(
-    page_title="PDF RAG Chatbot",
-    page_icon="📚",
-    layout="wide",
-)
-
-st.title("📚 PDF RAG Chatbot")
-st.caption("Upload a PDF, index it with FAISS, and ask questions using an open-weight Groq model.")
-
-with st.sidebar:
-    st.header("⚙️ Settings")
-    st.write(f"**LLM:** `{GROQ_MODEL}`")
-    st.write(f"**Embeddings:** `{EMBEDDING_MODEL_NAME}`")
-    st.write(f"**Chunk size:** {CHUNK_SIZE} tokens")
-    st.write(f"**Chunk overlap:** {CHUNK_OVERLAP} tokens")
-    st.write(f"**Top-K retrieval:** {TOP_K}")
-
-    if st.button("🗑️ Clear current document"):
-        for key in ["index", "chunks", "file_name", "num_pages"]:
-            st.session_state.pop(key, None)
-        st.rerun()
-
-uploaded_file = st.file_uploader(
-    "Upload a PDF document",
-    type=["pdf"],
-    help="The PDF is processed in memory for the current Streamlit session.",
-)
-
-if uploaded_file is not None:
-    # Only rebuild the index when a new file is uploaded.
-    if st.session_state.get("file_name") != uploaded_file.name:
-        pdf_bytes = uploaded_file.getvalue()
-
-        with st.spinner("Extracting PDF text..."):
-            pages = extract_pdf_text(pdf_bytes)
-
-        if not pages:
-            st.error(
-                "No extractable text was found. This app currently works best with "
-                "text-based PDFs. Scanned PDFs need OCR."
-            )
-            st.stop()
-
-        embedding_model = load_embedding_model()
-
-        with st.spinner("Creating token-based chunks..."):
-            chunks = build_chunks(pages, embedding_model.tokenizer)
-
-        if not chunks:
-            st.error("Could not create text chunks from this PDF.")
-            st.stop()
-
-        with st.spinner("Creating embeddings and FAISS index..."):
-            index = build_faiss_index(chunks, embedding_model)
-
-        st.session_state["index"] = index
-        st.session_state["chunks"] = chunks
-        st.session_state["file_name"] = uploaded_file.name
-        st.session_state["num_pages"] = len(pages)
-
-        # Reset conversation when a new document is indexed.
-        st.session_state["messages"] = []
-
-        st.success(
-            f"Indexed **{uploaded_file.name}** — {len(pages)} pages, "
-            f"{len(chunks)} chunks."
-        )
+# ============================================================
+# Session State
+# ============================================================
 
 if "index" not in st.session_state:
-    st.info("👆 Upload a PDF to build your searchable FAISS index.")
-    st.stop()
+    st.session_state.index = None
 
-st.success(
-    f"Current document: **{st.session_state['file_name']}** "
-    f"({st.session_state['num_pages']} pages)"
-)
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+
+if "file_hash" not in st.session_state:
+    st.session_state.file_hash = None
+
+if "file_name" not in st.session_state:
+    st.session_state.file_name = None
 
 if "messages" not in st.session_state:
-    st.session_state["messages"] = []
+    st.session_state.messages = []
 
-for message in st.session_state["messages"]:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
 
-query = st.chat_input("Ask a question about your PDF...")
+# ============================================================
+# Sidebar
+# ============================================================
 
-if query:
-    st.session_state["messages"].append({
-        "role": "user",
-        "content": query,
-    })
+with st.sidebar:
 
-    with st.chat_message("user"):
-        st.markdown(query)
+    st.title("📚 PDF RAG")
 
-    api_key = st.secrets.get("GROQ_API_KEY", os.getenv("GROQ_API_KEY"))
+    st.markdown(
+        """
+        Upload a PDF and ask questions about its contents.
 
-    if not api_key:
-        with st.chat_message("assistant"):
-            st.error(
-                "GROQ_API_KEY is not configured. Add it to Streamlit Secrets "
-                "or set it as an environment variable."
-            )
-        st.stop()
+        **Pipeline**
 
-    embedding_model = load_embedding_model()
+        PDF → Text Extraction → Chunking →
+        Embeddings → FAISS → Retrieval → Groq
+        """
+    )
 
-    with st.chat_message("assistant"):
-        with st.spinner("Searching the document..."):
-            results = retrieve(
-                query,
-                st.session_state["index"],
-                st.session_state["chunks"],
-                embedding_model,
-            )
+    st.divider()
 
-        if not results:
-            answer = "I couldn't find relevant information in the document."
-            st.markdown(answer)
-        else:
+    st.write("**LLM:**")
+    st.code(GROQ_MODEL)
+
+    st.write("**Embedding Model:**")
+    st.code(EMBEDDING_MODEL)
+
+    st.write("**Vector Database:**")
+    st.code("FAISS")
+
+    st.divider()
+
+    if st.button("🗑️ Clear Conversation"):
+
+        st.session_state.messages = []
+
+        st.rerun()
+
+
+# ============================================================
+# Main Application
+# ============================================================
+
+st.title("📚 PDF RAG Chatbot")
+
+st.write(
+    "Upload a PDF document and ask questions about its contents."
+)
+
+uploaded_file = st.file_uploader(
+    "Upload your PDF",
+    type=["pdf"],
+)
+
+
+# ============================================================
+# Process Uploaded PDF
+# ============================================================
+
+if uploaded_file is not None:
+
+    pdf_bytes = uploaded_file.getvalue()
+
+    current_file_hash = hashlib.md5(pdf_bytes).hexdigest()
+
+    # Only process the PDF when a new file is uploaded
+    if current_file_hash != st.session_state.file_hash:
+
+        with st.spinner(
+            "Processing PDF and creating vector index..."
+        ):
+
             try:
-                client = get_groq_client(api_key)
 
-                with st.spinner("Generating answer..."):
-                    answer = generate_answer(query, results, client)
+                pages = extract_text_from_pdf(pdf_bytes)
 
-                st.markdown(answer)
+                if not pages:
 
-                with st.expander("🔎 Retrieved sources"):
-                    for i, item in enumerate(results, start=1):
+                    st.error(
+                        "No extractable text was found in this PDF. "
+                        "It may be a scanned/image-based PDF. "
+                        "OCR will be required for such PDFs."
+                    )
+
+                    st.stop()
+
+                chunks = create_chunks(pages)
+
+                if not chunks:
+
+                    st.error(
+                        "No text chunks could be created from the PDF."
+                    )
+
+                    st.stop()
+
+                index = create_faiss_index(chunks)
+
+                st.session_state.index = index
+                st.session_state.chunks = chunks
+                st.session_state.file_hash = current_file_hash
+                st.session_state.file_name = uploaded_file.name
+                st.session_state.messages = []
+
+            except Exception as e:
+
+                st.error(
+                    f"An error occurred while processing the PDF: {e}"
+                )
+
+                st.stop()
+
+
+# ============================================================
+# Show Document Information
+# ============================================================
+
+if st.session_state.index is not None:
+
+    st.success(
+        f"✅ **{st.session_state.file_name}** is ready. "
+        f"Created {len(st.session_state.chunks)} chunks."
+    )
+
+    st.divider()
+
+    # ========================================================
+    # Display Chat History
+    # ========================================================
+
+    for message in st.session_state.messages:
+
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+            if (
+                message["role"] == "assistant"
+                and "sources" in message
+            ):
+
+                with st.expander("🔎 Retrieved Sources"):
+
+                    for source in message["sources"]:
+
                         st.markdown(
-                            f"**Source {i} — PDF page {item['page']} "
-                            f"(similarity: {item['score']:.3f})**"
+                            f"**Page {source['page']}** "
+                            f"(similarity: {source['score']:.3f})"
                         )
-                        st.write(item["text"])
 
-            except Exception as exc:
-                answer = f"Sorry, the Groq request failed: `{exc}`"
-                st.error(answer)
+                        st.write(source["text"])
 
-    st.session_state["messages"].append({
-        "role": "assistant",
-        "content": answer,
-    })
+                        st.divider()
+
+    # ========================================================
+    # Chat Input
+    # ========================================================
+
+    question = st.chat_input(
+        "Ask a question about your PDF..."
+    )
+
+    if question:
+
+        # Display user question
+        st.session_state.messages.append(
+            {
+                "role": "user",
+                "content": question,
+            }
+        )
+
+        with st.chat_message("user"):
+            st.markdown(question)
+
+        # Retrieve relevant chunks
+        with st.spinner("Searching the document..."):
+
+            retrieved_chunks = search_documents(
+                question,
+                st.session_state.index,
+                st.session_state.chunks,
+            )
+
+        # Generate answer
+        with st.chat_message("assistant"):
+
+            with st.spinner("Generating answer..."):
+
+                try:
+
+                    answer = generate_answer(
+                        question,
+                        retrieved_chunks,
+                    )
+
+                    st.markdown(answer)
+
+                    with st.expander("🔎 Retrieved Sources"):
+
+                        for source in retrieved_chunks:
+
+                            st.markdown(
+                                f"**Page {source['page']}** "
+                                f"(similarity: {source['score']:.3f})"
+                            )
+
+                            st.write(source["text"])
+
+                            st.divider()
+
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": answer,
+                            "sources": retrieved_chunks,
+                        }
+                    )
+
+                except Exception as e:
+
+                    error_message = (
+                        f"Sorry, an error occurred while "
+                        f"generating the answer: {e}"
+                    )
+
+                    st.error(error_message)
+
+                    st.session_state.messages.append(
+                        {
+                            "role": "assistant",
+                            "content": error_message,
+                        }
+                    )
+
+else:
+
+    st.info(
+        "👆 Upload a PDF above to start chatting with your document."
+    )
