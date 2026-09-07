@@ -8,7 +8,7 @@ The application extracts text from the PDF, splits it into token-based chunks, c
 
 Deployed using Streamlit Community Cloud.
 
-> Add your Streamlit Cloud URL here after deployment.
+(https://rag-based-ai-app-hu46rmwwh8fprdkzxcncvu.streamlit.app/)
 
 ---
 
